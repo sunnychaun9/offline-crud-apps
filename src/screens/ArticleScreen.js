@@ -2,7 +2,6 @@ import React, { useEffect, useState } from 'react';
 import { View, Text, TextInput, FlatList, Button, StyleSheet, TouchableOpacity, Alert } from 'react-native';
 import { Picker } from '@react-native-picker/picker';
 import { 
-  initDatabase, 
   addArticle, 
   getArticlesByBusinessId, 
   getAllBusinesses, 
@@ -37,26 +36,16 @@ const ArticleScreen = () => {
   const loadBusinesses = async () => {
     try {
       setLoading(true);
-      console.log('🔄 Loading businesses...');
-
-      // Ensure storage is synced first
       await syncStorageWithDatabase();
-
-      // Use the proper database function that handles AsyncStorage loading
       const result = await getAllBusinesses();
       const list = result.map(doc => doc.toJSON());
-
-      console.log('📈 Businesses loaded in ArticleScreen:', list);
       setBusinesses(list);
 
       if (list.length > 0) {
         setSelectedBusiness(list[0].id);
-        console.log('🎯 Selected first business:', list[0].id, list[0].name);
-      } else {
-        console.log('⚠️ No businesses found');
       }
     } catch (error) {
-      console.error('❌ Error loading businesses in ArticleScreen:', error);
+      console.error('Error loading businesses:', error);
     } finally {
       setLoading(false);
     }
@@ -66,17 +55,12 @@ const ArticleScreen = () => {
     if (!selectedBusiness) return;
 
     try {
-      console.log('🔍 Fetching articles for business:', selectedBusiness);
-      
-      // Ensure storage sync before fetching
       await syncStorageWithDatabase();
-      
       const result = await getArticlesByBusinessId(selectedBusiness);
       const list = result.map(doc => doc.toJSON());
-      console.log('🧾 Articles fetched for', selectedBusiness, list);
       setArticles(list);
     } catch (error) {
-      console.error('❌ Error fetching articles:', error);
+      console.error('Error fetching articles:', error);
       setArticles([]);
     }
   };
@@ -96,19 +80,17 @@ const ArticleScreen = () => {
         business_id: selectedBusiness,
       };
 
-      console.log('➕ Adding article:', article);
       await addArticle(article);
-      console.log('✅ Article added successfully');
 
       // Clear form
       setName('');
       setQty('');
       setPrice('');
 
-      // Refresh articles list with proper sync
+      // Refresh articles list
       await fetchArticles();
     } catch (error) {
-      console.error('❌ Error adding article:', error);
+      console.error('Error adding article:', error);
       Alert.alert('Error', 'Error adding article: ' + error.message);
     }
   };
@@ -119,14 +101,13 @@ const ArticleScreen = () => {
   };
 
   const handleArticleUpdated = async (updatedArticle) => {
-    // Refresh the articles list with proper sync
     await fetchArticles();
   };
 
   const handleDeleteArticle = async (article) => {
     Alert.alert(
       'Delete Article',
-      `Delete "${article.name}"?\n\nThis will be synced to all devices.`,
+      `Delete "${article.name}"?`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -134,25 +115,16 @@ const ArticleScreen = () => {
           style: 'destructive',
           onPress: async () => {
             try {
-              console.log('🗑️ Deleting article with sync:', article.id, article.name);
-              
               const success = await deleteArticleWithSync(article.id);
               
               if (success) {
-                console.log('✅ Article deleted and synced successfully');
-                
-                // Refresh the list immediately with proper sync
                 await fetchArticles();
-                
-                Alert.alert(
-                  'Deleted', 
-                  'Article deleted and synced to server.\n\nNote: Changes will be permanent after sync completes.'
-                );
+                Alert.alert('Deleted', 'Article deleted successfully');
               } else {
                 Alert.alert('Error', 'Article not found');
               }
             } catch (error) {
-              console.error('❌ Delete error:', error);
+              console.error('Delete error:', error);
               Alert.alert('Error', `Failed to delete: ${error.message}`);
             }
           }
@@ -162,7 +134,6 @@ const ArticleScreen = () => {
   };
 
   const handleRefresh = async () => {
-    console.log('🔄 Refreshing data...');
     await loadBusinesses();
     if (selectedBusiness) {
       await fetchArticles();
@@ -219,10 +190,7 @@ const ArticleScreen = () => {
         <>
           <Picker
             selectedValue={selectedBusiness}
-            onValueChange={value => {
-              console.log('👆 Business selected:', value);
-              setSelectedBusiness(value);
-            }}
+            onValueChange={value => setSelectedBusiness(value)}
             style={styles.picker}
           >
             {businesses.map(biz => (
