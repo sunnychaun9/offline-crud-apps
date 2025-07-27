@@ -1,6 +1,7 @@
 // src/database/database.js
 import { createRxDatabase, addRxPlugin } from 'rxdb';
 import { RxDBQueryBuilderPlugin } from 'rxdb/plugins/query-builder';
+import { RxDBUpdatePlugin } from 'rxdb/plugins/update';
 import { replicateCouchDB, getFetchWithCouchDBAuthorization } from 'rxdb/plugins/replication-couchdb';
 import { getRxStorageMemory } from 'rxdb/plugins/storage-memory';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -10,6 +11,7 @@ import { config } from '../config/environment';
 
 // Add plugins
 addRxPlugin(RxDBQueryBuilderPlugin);
+addRxPlugin(RxDBUpdatePlugin);
 
 let dbInstance;
 const DB_NAME = 'businessapp';
@@ -18,25 +20,6 @@ const DB_NAME = 'businessapp';
 const BUSINESSES_KEY = 'businesses_data';
 const ARTICLES_KEY = 'articles_data';
 const COUCHDB_URL_KEY = 'couchdb_url';
-
-// Multiple CouchDB URL options to try (NO trailing slash)
-// const COUCHDB_CONFIG = {
-//   // Try multiple URLs in order of preference
-//   possibleUrls: [
-//     'http://192.168.1.100:5984',
-//     'http://192.168.1.101:5984',
-//     'http://192.168.0.100:5984',
-//     'http://192.168.0.101:5984',
-//     'http://10.0.2.2:5984',
-//     'http://localhost:5984'
-//   ],
-//   businessesDB: 'businesses',
-//   articlesDB: 'articles',
-//   username: 'shani',
-//   password: 'shani@123456',
-//   currentUrl: null,
-//   timeout: 5000 // 5 second timeout for connection tests
-// };
 
 const COUCHDB_CONFIG = {
   possibleUrls: config.couchdb.possibleUrls,
@@ -53,7 +36,7 @@ let articleReplication = null;
 let isOnline = false;
 let syncEnabled = true;
 
-// Auto-detect working CouchDB URL
+// Auto-detect working CouchDB URL with improved error handling
 const detectCouchDBUrl = async () => {
   console.log('🔍 Auto-detecting CouchDB URL...');
   
@@ -67,7 +50,7 @@ const detectCouchDBUrl = async () => {
     }
   }
 
-  // Test each possible URL
+  // Test each possible URL with faster timeout for production
   for (const url of COUCHDB_CONFIG.possibleUrls) {
     console.log('🔍 Testing URL:', url);
     if (await testCouchDBUrl(url)) {
@@ -83,7 +66,7 @@ const detectCouchDBUrl = async () => {
   return null;
 };
 
-// Test a specific CouchDB URL
+// Test a specific CouchDB URL with faster timeout
 const testCouchDBUrl = async (url) => {
   try {
     const customFetch = getFetchWithCouchDBAuthorization(
@@ -116,108 +99,6 @@ const testCouchDBUrl = async (url) => {
       console.log(`❌ Connection failed for ${url}:`, error.message);
     }
     return false;
-  }
-};
-
-// Add these functions to your database.js file
-
-export const updateBusiness = async (businessId, updatedData) => {
-  try {
-    const db = await initDatabase();
-    
-    // Find the business document
-    const businessDoc = await db.businesses
-      .findOne()
-      .where('id')
-      .equals(businessId)
-      .exec();
-    
-    if (!businessDoc) {
-      throw new Error('Business not found');
-    }
-    
-    // Update the document
-    await businessDoc.update({
-      $set: {
-        name: updatedData.name,
-        // Add other fields as needed
-      }
-    });
-    
-    // Persist to AsyncStorage
-    await saveBusinessesToStorage(db);
-    
-    console.log('✅ Business updated and persisted:', businessDoc.toJSON());
-    return businessDoc;
-  } catch (error) {
-    console.error('❌ Error updating business:', error);
-    throw error;
-  }
-};
-
-export const updateArticleData = async (articleId, updatedData) => {
-  try {
-    const db = await initDatabase();
-    
-    // Find the article document
-    const articleDoc = await db.articles
-      .findOne()
-      .where('id')
-      .equals(articleId)
-      .exec();
-    
-    if (!articleDoc) {
-      throw new Error('Article not found');
-    }
-    
-    // Update the document
-    await articleDoc.update({
-      $set: {
-        name: updatedData.name,
-        qty: updatedData.qty,
-        selling_price: updatedData.selling_price,
-        business_id: updatedData.business_id,
-      }
-    });
-    
-    // Persist to AsyncStorage
-    await saveArticlesToStorage(db);
-    
-    console.log('✅ Article updated and persisted:', articleDoc.toJSON());
-    return articleDoc;
-  } catch (error) {
-    console.error('❌ Error updating article:', error);
-    throw error;
-  }
-};
-
-export const getBusinessById = async (businessId) => {
-  try {
-    const db = await initDatabase();
-    const result = await db.businesses
-      .findOne()
-      .where('id')
-      .equals(businessId)
-      .exec();
-    return result;
-  } catch (error) {
-    console.error('❌ Error fetching business by ID:', error);
-    throw error;
-  }
-};
-
-export const getArticleById = async (articleId) => {
-  try {
-    const db = await initDatabase();
-    const result = await db.articles
-      .findOne()
-      .where('id')
-      .equals(articleId)
-      .exec();
-    return result;
-  } catch (error) {
-    console.error('❌ Error fetching article by ID:', error);
-    throw error;
   }
 };
 
@@ -301,17 +182,6 @@ const setupNetworkMonitoring = async (db) => {
   }
 };
 
-// Test CouchDB connection with current or auto-detected URL
-const testCouchDBConnection = async () => {
-  if (!COUCHDB_CONFIG.currentUrl) {
-    console.log('🔍 No current URL, attempting auto-detection...');
-    const workingUrl = await detectCouchDBUrl();
-    return workingUrl !== null;
-  }
-
-  return await testCouchDBUrl(COUCHDB_CONFIG.currentUrl);
-};
-
 // Start bidirectional sync with auto-detected CouchDB URL
 const startSync = async (db) => {
   if (!isOnline || !syncEnabled) {
@@ -367,51 +237,37 @@ const startSync = async (db) => {
       throw dbTestError;
     }
 
-    // Setup businesses replication with explicit trailing slash
+    // Setup businesses replication
     console.log('🔄 Setting up business replication...');
-    try {
-      businessReplication = replicateCouchDB({
-        replicationIdentifier: 'business-replication',
-        collection: db.businesses,
-        url: businessUrl,
-        live: true,
-        fetch: customFetch,
-        pull: {
-          batchSize: 10
-        },
-        push: {
-          batchSize: 10
-        }
-      });
-      
-      console.log('🔍 Business replication object:', businessReplication ? 'Created' : 'Failed');
-    } catch (error) {
-      console.error('❌ Business replication creation failed:', error);
-      throw error;
-    }
+    businessReplication = replicateCouchDB({
+      replicationIdentifier: 'business-replication',
+      collection: db.businesses,
+      url: businessUrl,
+      live: true,
+      fetch: customFetch,
+      pull: {
+        batchSize: 10
+      },
+      push: {
+        batchSize: 10
+      }
+    });
 
-    // Setup articles replication with explicit trailing slash
+    // Setup articles replication
     console.log('🔄 Setting up article replication...');
-    try {
-      articleReplication = replicateCouchDB({
-        replicationIdentifier: 'article-replication',
-        collection: db.articles,
-        url: articleUrl,
-        live: true,
-        fetch: customFetch,
-        pull: {
-          batchSize: 10
-        },
-        push: {
-          batchSize: 10
-        }
-      });
-      
-      console.log('🔍 Article replication object:', articleReplication ? 'Created' : 'Failed');
-    } catch (error) {
-      console.error('❌ Article replication creation failed:', error);
-      throw error;
-    }
+    articleReplication = replicateCouchDB({
+      replicationIdentifier: 'article-replication',
+      collection: db.articles,
+      url: articleUrl,
+      live: true,
+      fetch: customFetch,
+      pull: {
+        batchSize: 10
+      },
+      push: {
+        batchSize: 10
+      }
+    });
 
     // Enhanced error handling for businesses
     if (businessReplication && businessReplication.error$) {
@@ -423,9 +279,16 @@ const startSync = async (db) => {
 
       businessReplication.sent$.subscribe(docData => {
         console.log('📤 SUCCESS! Business documents sent to CouchDB:', docData.length);
+        // Update AsyncStorage after successful sync
+        setTimeout(() => saveBusinessesToStorage(db), 1000);
       });
-    } else {
-      console.error('❌ Business replication object is invalid');
+
+      // Listen for received documents
+      businessReplication.received$.subscribe(docData => {
+        console.log('📥 Business documents received from CouchDB:', docData.length);
+        // Update AsyncStorage after receiving data
+        setTimeout(() => saveBusinessesToStorage(db), 1000);
+      });
     }
 
     // Enhanced error handling for articles
@@ -438,12 +301,19 @@ const startSync = async (db) => {
 
       articleReplication.sent$.subscribe(docData => {
         console.log('📤 SUCCESS! Article documents sent to CouchDB:', docData.length);
+        // Update AsyncStorage after successful sync
+        setTimeout(() => saveArticlesToStorage(db), 1000);
       });
-    } else {
-      console.error('❌ Article replication object is invalid');
+
+      // Listen for received documents
+      articleReplication.received$.subscribe(docData => {
+        console.log('📥 Article documents received from CouchDB:', docData.length);
+        // Update AsyncStorage after receiving data
+        setTimeout(() => saveArticlesToStorage(db), 1000);
+      });
     }
 
-    console.log('✅ CouchDB sync setup completed - check for success messages above');
+    console.log('✅ CouchDB sync setup completed');
 
   } catch (error) {
     console.error('❌ Error starting sync:', error);
@@ -467,214 +337,6 @@ const stopSync = () => {
     }
   } catch (error) {
     console.error('❌ Error stopping sync:', error);
-  }
-};
-
-// Enhanced database creation with auto-detected URL
-export const createCouchDBDatabases = async () => {
-  if (!isOnline) {
-    return { success: false, message: 'Offline' };
-  }
-
-  try {
-    // Ensure we have a working URL
-    const workingUrl = COUCHDB_CONFIG.currentUrl || await detectCouchDBUrl();
-    
-    if (!workingUrl) {
-      return { success: false, message: 'No accessible CouchDB server found' };
-    }
-
-    console.log('🔧 Creating/verifying CouchDB databases at:', workingUrl);
-    
-    const customFetch = getFetchWithCouchDBAuthorization(
-      COUCHDB_CONFIG.username,
-      COUCHDB_CONFIG.password
-    );
-
-    // Clean URL to avoid double slashes
-    const cleanUrl = workingUrl.replace(/\/$/, '');
-
-    // Test connection first
-    const serverResponse = await customFetch(`${cleanUrl}/`);
-    
-    if (!serverResponse.ok) {
-      throw new Error(`CouchDB server not accessible: ${serverResponse.status}`);
-    }
-
-    // Create businesses database
-    const businessResponse = await customFetch(
-      `${cleanUrl}/${COUCHDB_CONFIG.businessesDB}`,
-      { method: 'PUT' }
-    );
-
-    if (businessResponse.ok) {
-      console.log('✅ Businesses database created');
-    } else if (businessResponse.status === 412) {
-      console.log('ℹ️ Businesses database already exists');
-    }
-
-    // Create articles database
-    const articleResponse = await customFetch(
-      `${cleanUrl}/${COUCHDB_CONFIG.articlesDB}`,
-      { method: 'PUT' }
-    );
-
-    if (articleResponse.ok) {
-      console.log('✅ Articles database created');
-    } else if (articleResponse.status === 412) {
-      console.log('ℹ️ Articles database already exists');
-    }
-
-    return { success: true, message: `Databases ready at ${workingUrl}` };
-  } catch (error) {
-    console.error('❌ Error creating CouchDB databases:', error);
-    return { success: false, message: error.message };
-  }
-};
-
-// Get detailed sync status including current URL
-export const getSyncStatus = () => {
-  try {
-    return {
-      isOnline,
-      syncEnabled,
-      businessSyncActive: businessReplication !== null && !businessReplication.isStopped(),
-      articleSyncActive: articleReplication !== null && !articleReplication.isStopped(),
-      currentUrl: COUCHDB_CONFIG.currentUrl,
-      businessesDB: COUCHDB_CONFIG.businessesDB,
-      articlesDB: COUCHDB_CONFIG.articlesDB
-    };
-  } catch (error) {
-    console.error('❌ Error getting sync status:', error);
-    return {
-      isOnline,
-      syncEnabled,
-      businessSyncActive: false,
-      articleSyncActive: false,
-      currentUrl: COUCHDB_CONFIG.currentUrl,
-      businessesDB: COUCHDB_CONFIG.businessesDB,
-      articlesDB: COUCHDB_CONFIG.articlesDB
-    };
-  }
-};
-
-// Manual URL detection trigger
-export const rediscoverCouchDBUrl = async () => {
-  console.log('🔄 Manual CouchDB URL rediscovery triggered...');
-  COUCHDB_CONFIG.currentUrl = null;
-  await AsyncStorage.removeItem(COUCHDB_URL_KEY);
-  return await detectCouchDBUrl();
-};
-
-// Test connectivity with current setup
-export const testCouchDBConnectivity = async () => {
-  return await testCouchDBConnection();
-};
-
-// Force sync with URL detection
-export const forceSyncNow = async () => {
-  if (!isOnline) {
-    return { success: false, message: 'Offline' };
-  }
-
-  try {
-    // Ensure we have a working URL
-    const workingUrl = COUCHDB_CONFIG.currentUrl || await detectCouchDBUrl();
-    
-    if (!workingUrl) {
-      return { success: false, message: 'No accessible CouchDB server found. Check network and server configuration.' };
-    }
-
-    const db = await initDatabase();
-    await startSync(db);
-    return { success: true, message: `Sync started with ${workingUrl}` };
-  } catch (error) {
-    console.error('❌ Error forcing sync:', error);
-    return { success: false, message: error.message };
-  }
-};
-
-// Manual sync trigger to push local data to CouchDB
-export const pushLocalDataToCouchDB = async () => {
-  try {
-    console.log('🔍 === Push Data Debug Start ===');
-    
-    // Force check network status
-    const netInfo = await NetInfo.fetch();
-    const actualIsOnline = netInfo.isConnected;
-    console.log('📡 Fresh network check:', actualIsOnline);
-    console.log('📡 Stored isOnline:', isOnline);
-    
-    // Update our internal status
-    isOnline = actualIsOnline;
-    
-    console.log('🔗 Current URL check:', COUCHDB_CONFIG.currentUrl);
-    console.log('⚙️ Sync enabled check:', syncEnabled);
-    
-    if (!actualIsOnline) {
-      return { success: false, message: 'Device is offline (fresh check)' };
-    }
-    
-    // Force URL detection if none exists
-    if (!COUCHDB_CONFIG.currentUrl) {
-      console.log('🔍 No current URL, forcing detection...');
-      const detectedUrl = await detectCouchDBUrl();
-      if (!detectedUrl) {
-        return { success: false, message: 'No accessible CouchDB server found after detection attempt' };
-      }
-      console.log('✅ Detected URL after force check:', detectedUrl);
-    }
-
-    const db = await initDatabase();
-    
-    // Get all local data
-    const businesses = await db.businesses.find().exec();
-    const articles = await db.articles.find().exec();
-    
-    console.log(`📤 Local data to push: ${businesses.length} businesses, ${articles.length} articles`);
-    
-    // Log the actual documents
-    if (businesses.length > 0) {
-      console.log('📋 Business documents:', businesses.map(b => ({ id: b.id, name: b.name })));
-    }
-    if (articles.length > 0) {
-      console.log('📋 Article documents:', articles.map(a => ({ id: a.id, name: a.name })));
-    }
-    
-    if (businesses.length === 0 && articles.length === 0) {
-      return { success: true, message: 'No local data to sync' };
-    }
-
-    // Force restart sync to push data
-    console.log('🔄 Stopping current replications...');
-    stopSync();
-    
-    // Wait a moment then restart sync
-    console.log('🔄 Starting fresh sync...');
-    await startSync(db);
-
-    return { success: true, message: `Sync restarted for ${businesses.length + articles.length} documents. Check console for sync progress.` };
-  } catch (error) {
-    console.error('❌ Error pushing local data:', error);
-    return { success: false, message: error.message };
-  }
-};
-
-// Enable/disable sync
-export const setSyncEnabled = (enabled) => {
-  syncEnabled = enabled;
-  console.log('🔧 Sync', enabled ? 'enabled' : 'disabled');
-  
-  if (!enabled) {
-    stopSync();
-  } else if (isOnline) {
-    initDatabase().then(db => {
-      detectCouchDBUrl().then(workingUrl => {
-        if (workingUrl) {
-          startSync(db);
-        }
-      });
-    });
   }
 };
 
@@ -715,57 +377,71 @@ const loadPersistedData = async (db) => {
   }
 };
 
-// Save businesses to AsyncStorage
+// Save businesses to AsyncStorage with error handling
 const saveBusinessesToStorage = async (db) => {
   try {
     const allBusinesses = await db.businesses.find().exec();
     const businessData = allBusinesses.map(doc => doc.toJSON());
     await AsyncStorage.setItem(BUSINESSES_KEY, JSON.stringify(businessData));
-    console.log('💾 Businesses saved to storage');
+    console.log(`💾 ${businessData.length} businesses saved to storage`);
+    return businessData;
   } catch (error) {
     console.error('❌ Error saving businesses:', error);
+    return [];
   }
 };
 
-// Save articles to AsyncStorage
+// Save articles to AsyncStorage with error handling
 const saveArticlesToStorage = async (db) => {
   try {
     const allArticles = await db.articles.find().exec();
     const articleData = allArticles.map(doc => doc.toJSON());
     await AsyncStorage.setItem(ARTICLES_KEY, JSON.stringify(articleData));
-    console.log('💾 Articles saved to storage');
+    console.log(`💾 ${articleData.length} articles saved to storage`);
+    return articleData;
   } catch (error) {
     console.error('❌ Error saving articles:', error);
+    return [];
   }
 };
 
-export const addArticle = async (article) => {
+// Sync AsyncStorage with RxDB (fixes the old data appearing issue)
+export const syncStorageWithDatabase = async () => {
   try {
+    console.log('🔄 Syncing AsyncStorage with RxDB...');
+    
     const db = await initDatabase();
     
-    // Don't add _id - let RxDB handle the ID mapping
-    const inserted = await db.articles.insert(article);
+    // Get current data from RxDB (source of truth)
+    const businesses = await db.businesses.find().exec();
+    const articles = await db.articles.find().exec();
     
-    // Persist to AsyncStorage (backup)
-    await saveArticlesToStorage(db);
+    const businessData = businesses.map(doc => doc.toJSON());
+    const articleData = articles.map(doc => doc.toJSON());
     
-    console.log('✅ Article inserted and persisted:', inserted.toJSON());
+    // Update AsyncStorage to match RxDB
+    await AsyncStorage.setItem(BUSINESSES_KEY, JSON.stringify(businessData));
+    await AsyncStorage.setItem(ARTICLES_KEY, JSON.stringify(articleData));
     
-    // Log for debugging
-    console.log('🔍 Article document structure:', JSON.stringify(inserted.toJSON(), null, 2));
+    console.log(`✅ AsyncStorage synced: ${businessData.length} businesses, ${articleData.length} articles`);
     
-    return inserted;
+    return {
+      success: true,
+      businesses: businessData.length,
+      articles: articleData.length
+    };
   } catch (error) {
-    console.error('❌ Error adding article:', error);
-    throw error;
+    console.error('❌ Error syncing storage with database:', error);
+    return { success: false, message: error.message };
   }
 };
 
+// CRUD Operations with improved sync
 export const addBusiness = async (business) => {
   try {
     const db = await initDatabase();
     
-    // Ensure document matches schema (no address field)
+    // Ensure document matches schema
     const businessDoc = {
       id: business.id,
       name: business.name,
@@ -773,14 +449,10 @@ export const addBusiness = async (business) => {
     
     const inserted = await db.businesses.insert(businessDoc);
     
-    // Persist to AsyncStorage (backup)
+    // Immediately persist to AsyncStorage
     await saveBusinessesToStorage(db);
     
     console.log('✅ Business inserted and persisted:', inserted.toJSON());
-    
-    // Log for debugging
-    console.log('🔍 Business document structure:', JSON.stringify(inserted.toJSON(), null, 2));
-    
     return inserted;
   } catch (error) {
     console.error('❌ Error adding business:', error);
@@ -788,49 +460,156 @@ export const addBusiness = async (business) => {
   }
 };
 
-export const updateArticle = async (articleDoc) => {
+export const addArticle = async (article) => {
   try {
-    await articleDoc.save();
-    
-    // Update persistence
     const db = await initDatabase();
+    
+    const inserted = await db.articles.insert(article);
+    
+    // Immediately persist to AsyncStorage
     await saveArticlesToStorage(db);
     
-    console.log('✅ Article updated and persisted');
+    console.log('✅ Article inserted and persisted:', inserted.toJSON());
+    return inserted;
+  } catch (error) {
+    console.error('❌ Error adding article:', error);
+    throw error;
+  }
+};
+
+export const updateBusiness = async (businessId, updatedData) => {
+  try {
+    const db = await initDatabase();
+    
+    const businessDoc = await db.businesses
+      .findOne()
+      .where('id')
+      .equals(businessId)
+      .exec();
+    
+    if (!businessDoc) {
+      throw new Error('Business not found');
+    }
+    
+    const updatedDoc = await businessDoc.modify(docData => {
+      docData.name = updatedData.name;
+      return docData;
+    });
+    
+    // Immediately persist to AsyncStorage
+    await saveBusinessesToStorage(db);
+    
+    console.log('✅ Business updated and persisted:', updatedDoc.toJSON());
+    return updatedDoc;
+  } catch (error) {
+    console.error('❌ Error updating business:', error);
+    throw error;
+  }
+};
+
+export const updateArticleData = async (articleId, updatedData) => {
+  try {
+    const db = await initDatabase();
+    
+    const articleDoc = await db.articles
+      .findOne()
+      .where('id')
+      .equals(articleId)
+      .exec();
+    
+    if (!articleDoc) {
+      throw new Error('Article not found');
+    }
+    
+    const updatedDoc = await articleDoc.modify(docData => {
+      docData.name = updatedData.name;
+      docData.qty = updatedData.qty;
+      docData.selling_price = updatedData.selling_price;
+      docData.business_id = updatedData.business_id;
+      return docData;
+    });
+    
+    // Immediately persist to AsyncStorage
+    await saveArticlesToStorage(db);
+    
+    console.log('✅ Article updated and persisted:', updatedDoc.toJSON());
+    return updatedDoc;
   } catch (error) {
     console.error('❌ Error updating article:', error);
     throw error;
   }
 };
 
-export const deleteArticle = async (articleDoc) => {
-  try {
-    await articleDoc.remove();
-    
-    // Update persistence
-    const db = await initDatabase();
-    await saveArticlesToStorage(db);
-    
-    console.log('🗑️ Article deleted and persisted');
-  } catch (error) {
-    console.error('❌ Error deleting article:', error);
-    throw error;
-  }
-};
-
 export const deleteBusiness = async (businessDoc) => {
   try {
+    console.log('🗑️ Deleting business:', businessDoc.id, businessDoc.name);
+    
     await businessDoc.remove();
     
-    // Update persistence
+    // Immediately update AsyncStorage
     const db = await initDatabase();
     await saveBusinessesToStorage(db);
     
-    console.log('🗑️ Business deleted and persisted');
+    console.log('✅ Business deleted and persisted');
+    return { success: true };
   } catch (error) {
     console.error('❌ Error deleting business:', error);
     throw error;
   }
+};
+
+export const deleteArticleWithSync = async (articleId) => {
+  try {
+    console.log('🗑️ Starting article deletion with sync:', articleId);
+    
+    const db = await initDatabase();
+    
+    const articleDoc = await db.articles
+      .findOne()
+      .where('id')
+      .equals(articleId)
+      .exec();
+    
+    if (!articleDoc) {
+      console.log('❌ Article not found:', articleId);
+      return false;
+    }
+    
+    const articleName = articleDoc.name;
+    console.log('📄 Found article to delete:', articleName);
+    
+    // Remove from RxDB (this will sync the deletion)
+    await articleDoc.remove();
+    console.log('✅ Article removed from RxDB');
+    
+    // IMMEDIATELY update AsyncStorage to reflect the deletion
+    await saveArticlesToStorage(db);
+    
+    // Force a sync if online
+    if (isOnline && syncEnabled) {
+      console.log('🔄 Forcing sync to propagate deletion...');
+      setTimeout(async () => {
+        try {
+          const syncResult = await forceSyncNow();
+          console.log('📤 Deletion sync result:', syncResult.message);
+        } catch (syncError) {
+          console.error('❌ Sync error after deletion:', syncError);
+        }
+      }, 500);
+    }
+    
+    console.log(`✅ Article "${articleName}" successfully deleted and storage updated`);
+    return true;
+    
+  } catch (error) {
+    console.error('❌ Error in deleteArticleWithSync:', error);
+    throw error;
+  }
+};
+
+// Legacy delete function for compatibility
+export const deleteArticleById = async (articleId) => {
+  return await deleteArticleWithSync(articleId);
 };
 
 export const getArticlesByBusinessId = async (businessId) => {
@@ -859,32 +638,168 @@ export const getAllBusinesses = async () => {
   }
 };
 
-// Helper function for backward compatibility
-export const getRxDatabase = async () => {
-  return await initDatabase();
-};
-
-// Clear all data (for testing)
-export const clearAllData = async () => {
+export const getBusinessById = async (businessId) => {
   try {
-    await AsyncStorage.removeItem(BUSINESSES_KEY);
-    await AsyncStorage.removeItem(ARTICLES_KEY);
-    await AsyncStorage.removeItem(COUCHDB_URL_KEY);
-    
-    // Stop sync before destroying
-    stopSync();
-    
-    if (dbInstance) {
-      await dbInstance.destroy();
-      dbInstance = null;
-    }
-    console.log('🧹 All data cleared');
+    const db = await initDatabase();
+    const result = await db.businesses
+      .findOne()
+      .where('id')
+      .equals(businessId)
+      .exec();
+    return result;
   } catch (error) {
-    console.error('❌ Error clearing data:', error);
+    console.error('❌ Error fetching business by ID:', error);
+    throw error;
   }
 };
 
-// Get storage stats
+export const getArticleById = async (articleId) => {
+  try {
+    const db = await initDatabase();
+    const result = await db.articles
+      .findOne()
+      .where('id')
+      .equals(articleId)
+      .exec();
+    return result;
+  } catch (error) {
+    console.error('❌ Error fetching article by ID:', error);
+    throw error;
+  }
+};
+
+// Database management functions
+export const createCouchDBDatabases = async () => {
+  if (!isOnline) {
+    return { success: false, message: 'Offline' };
+  }
+
+  try {
+    const workingUrl = COUCHDB_CONFIG.currentUrl || await detectCouchDBUrl();
+    
+    if (!workingUrl) {
+      return { success: false, message: 'No accessible CouchDB server found' };
+    }
+
+    console.log('🔧 Creating/verifying CouchDB databases at:', workingUrl);
+    
+    const customFetch = getFetchWithCouchDBAuthorization(
+      COUCHDB_CONFIG.username,
+      COUCHDB_CONFIG.password
+    );
+
+    const cleanUrl = workingUrl.replace(/\/$/, '');
+
+    // Test connection first
+    const serverResponse = await customFetch(`${cleanUrl}/`);
+    
+    if (!serverResponse.ok) {
+      throw new Error(`CouchDB server not accessible: ${serverResponse.status}`);
+    }
+
+    // Create businesses database
+    const businessResponse = await customFetch(
+      `${cleanUrl}/${COUCHDB_CONFIG.businessesDB}`,
+      { method: 'PUT' }
+    );
+
+    if (businessResponse.ok) {
+      console.log('✅ Businesses database created');
+    } else if (businessResponse.status === 412) {
+      console.log('ℹ️ Businesses database already exists');
+    }
+
+    // Create articles database
+    const articleResponse = await customFetch(
+      `${cleanUrl}/${COUCHDB_CONFIG.articlesDB}`,
+      { method: 'PUT' }
+    );
+
+    if (articleResponse.ok) {
+      console.log('✅ Articles database created');
+    } else if (articleResponse.status === 412) {
+      console.log('ℹ️ Articles database already exists');
+    }
+
+    return { success: true, message: `Databases ready at ${workingUrl}` };
+  } catch (error) {
+    console.error('❌ Error creating CouchDB databases:', error);
+    return { success: false, message: error.message };
+  }
+};
+
+export const getSyncStatus = () => {
+  try {
+    return {
+      isOnline,
+      syncEnabled,
+      businessSyncActive: businessReplication !== null && !businessReplication.isStopped(),
+      articleSyncActive: articleReplication !== null && !articleReplication.isStopped(),
+      currentUrl: COUCHDB_CONFIG.currentUrl,
+      businessesDB: COUCHDB_CONFIG.businessesDB,
+      articlesDB: COUCHDB_CONFIG.articlesDB
+    };
+  } catch (error) {
+    console.error('❌ Error getting sync status:', error);
+    return {
+      isOnline,
+      syncEnabled,
+      businessSyncActive: false,
+      articleSyncActive: false,
+      currentUrl: COUCHDB_CONFIG.currentUrl,
+      businessesDB: COUCHDB_CONFIG.businessesDB,
+      articlesDB: COUCHDB_CONFIG.articlesDB
+    };
+  }
+};
+
+export const testCouchDBConnectivity = async () => {
+  if (!COUCHDB_CONFIG.currentUrl) {
+    console.log('🔍 No current URL, attempting auto-detection...');
+    const workingUrl = await detectCouchDBUrl();
+    return workingUrl !== null;
+  }
+  return await testCouchDBUrl(COUCHDB_CONFIG.currentUrl);
+};
+
+export const forceSyncNow = async () => {
+  if (!isOnline) {
+    return { success: false, message: 'Offline' };
+  }
+
+  try {
+    const workingUrl = COUCHDB_CONFIG.currentUrl || await detectCouchDBUrl();
+    
+    if (!workingUrl) {
+      return { success: false, message: 'No accessible CouchDB server found. Check network and server configuration.' };
+    }
+
+    const db = await initDatabase();
+    await startSync(db);
+    return { success: true, message: `Sync started with ${workingUrl}` };
+  } catch (error) {
+    console.error('❌ Error forcing sync:', error);
+    return { success: false, message: error.message };
+  }
+};
+
+export const setSyncEnabled = (enabled) => {
+  syncEnabled = enabled;
+  console.log('🔧 Sync', enabled ? 'enabled' : 'disabled');
+  
+  if (!enabled) {
+    stopSync();
+  } else if (isOnline) {
+    initDatabase().then(db => {
+      detectCouchDBUrl().then(workingUrl => {
+        if (workingUrl) {
+          startSync(db);
+        }
+      });
+    });
+  }
+};
+
 export const getStorageStats = async () => {
   try {
     const businessesData = await AsyncStorage.getItem(BUSINESSES_KEY);
@@ -905,5 +820,280 @@ export const getStorageStats = async () => {
       articles: 0, 
       syncStatus: getSyncStatus() 
     };
+  }
+};
+
+// Database reset and cleanup functions
+export const cleanupAndReset = async () => {
+  try {
+    console.log('🧹 Starting database cleanup...');
+    
+    stopSync();
+    
+    await AsyncStorage.removeItem(BUSINESSES_KEY);
+    await AsyncStorage.removeItem(ARTICLES_KEY);
+    await AsyncStorage.removeItem(COUCHDB_URL_KEY);
+    
+    if (dbInstance) {
+      await dbInstance.destroy();
+      dbInstance = null;
+    }
+    
+    console.log('✅ Local database cleaned up');
+    return { success: true, message: 'Local database cleaned up successfully' };
+  } catch (error) {
+    console.error('❌ Error during cleanup:', error);
+    return { success: false, message: error.message };
+  }
+};
+
+export const deleteCouchDBDatabases = async () => {
+  try {
+    const workingUrl = COUCHDB_CONFIG.currentUrl || await detectCouchDBUrl();
+    
+    if (!workingUrl) {
+      return { success: false, message: 'No accessible CouchDB server found' };
+    }
+
+    console.log('🗑️ Deleting CouchDB databases...');
+    
+    const customFetch = getFetchWithCouchDBAuthorization(
+      COUCHDB_CONFIG.username,
+      COUCHDB_CONFIG.password
+    );
+
+    const cleanUrl = workingUrl.replace(/\/$/, '');
+
+    // Delete businesses database
+    try {
+      const businessResponse = await customFetch(
+        `${cleanUrl}/${COUCHDB_CONFIG.businessesDB}`,
+        { method: 'DELETE' }
+      );
+      console.log('🗑️ Businesses database deleted:', businessResponse.status);
+    } catch (error) {
+      console.log('ℹ️ Businesses database might not exist');
+    }
+
+    // Delete articles database
+    try {
+      const articleResponse = await customFetch(
+        `${cleanUrl}/${COUCHDB_CONFIG.articlesDB}`,
+        { method: 'DELETE' }
+      );
+      console.log('🗑️ Articles database deleted:', articleResponse.status);
+    } catch (error) {
+      console.log('ℹ️ Articles database might not exist');
+    }
+
+    return { success: true, message: 'CouchDB databases deleted successfully' };
+  } catch (error) {
+    console.error('❌ Error deleting CouchDB databases:', error);
+    return { success: false, message: error.message };
+  }
+};
+
+export const fullDatabaseReset = async () => {
+  try {
+    console.log('🔄 Starting full database reset...');
+    
+    const localCleanup = await cleanupAndReset();
+    if (!localCleanup.success) {
+      throw new Error(`Local cleanup failed: ${localCleanup.message}`);
+    }
+    
+    const couchCleanup = await deleteCouchDBDatabases();
+    if (!couchCleanup.success) {
+      console.warn(`CouchDB cleanup warning: ${couchCleanup.message}`);
+    }
+    
+    const dbCreation = await createCouchDBDatabases();
+    if (!dbCreation.success) {
+      throw new Error(`Database creation failed: ${dbCreation.message}`);
+    }
+    
+    await initDatabase();
+    
+    console.log('✅ Full database reset completed successfully');
+    return { success: true, message: 'Full database reset completed successfully' };
+  } catch (error) {
+    console.error('❌ Full database reset failed:', error);
+    return { success: false, message: error.message };
+  }
+};
+
+export const permanentlyDeleteAllData = async () => {
+  try {
+    console.log('🧹 Starting permanent deletion of all data...');
+    
+    stopSync();
+    console.log('🛑 Sync stopped');
+    
+    await AsyncStorage.removeItem(BUSINESSES_KEY);
+    await AsyncStorage.removeItem(ARTICLES_KEY);
+    await AsyncStorage.removeItem(COUCHDB_URL_KEY);
+    console.log('🧹 Local storage cleared');
+    
+    if (dbInstance) {
+      await dbInstance.destroy();
+      dbInstance = null;
+      console.log('🗑️ Local database destroyed');
+    }
+    
+    const workingUrl = COUCHDB_CONFIG.currentUrl || await detectCouchDBUrl();
+    
+    if (workingUrl) {
+      console.log('🗑️ Deleting CouchDB databases...');
+      
+      const customFetch = getFetchWithCouchDBAuthorization(
+        COUCHDB_CONFIG.username,
+        COUCHDB_CONFIG.password
+      );
+
+      const cleanUrl = workingUrl.replace(/\/$/, '');
+
+      try {
+        const businessResponse = await customFetch(
+          `${cleanUrl}/${COUCHDB_CONFIG.businessesDB}`,
+          { method: 'DELETE' }
+        );
+        console.log('🗑️ CouchDB businesses database deleted:', businessResponse.status);
+      } catch (error) {
+        console.log('ℹ️ Businesses database deletion result:', error.message);
+      }
+
+      try {
+        const articleResponse = await customFetch(
+          `${cleanUrl}/${COUCHDB_CONFIG.articlesDB}`,
+          { method: 'DELETE' }
+        );
+        console.log('🗑️ CouchDB articles database deleted:', articleResponse.status);
+      } catch (error) {
+        console.log('ℹ️ Articles database deletion result:', error.message);
+      }
+      
+      console.log('⏱️ Waiting before recreating databases...');
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      const recreateResult = await createCouchDBDatabases();
+      console.log('🔄 Database recreation result:', recreateResult.message);
+    }
+    
+    await initDatabase();
+    console.log('✅ Fresh database initialized');
+    
+    return { success: true, message: 'All data permanently deleted and databases reset' };
+  } catch (error) {
+    console.error('❌ Error in permanent deletion:', error);
+    return { success: false, message: error.message };
+  }
+};
+
+export const verifyDatabasesAreEmpty = async () => {
+  try {
+    const workingUrl = COUCHDB_CONFIG.currentUrl || await detectCouchDBUrl();
+    
+    if (!workingUrl) {
+      return { success: false, message: 'No CouchDB connection available' };
+    }
+
+    const customFetch = getFetchWithCouchDBAuthorization(
+      COUCHDB_CONFIG.username,
+      COUCHDB_CONFIG.password
+    );
+
+    const cleanUrl = workingUrl.replace(/\/$/, '');
+
+    const businessResponse = await customFetch(`${cleanUrl}/${COUCHDB_CONFIG.businessesDB}/_all_docs`);
+    const businessData = await businessResponse.json();
+    
+    const articleResponse = await customFetch(`${cleanUrl}/${COUCHDB_CONFIG.articlesDB}/_all_docs`);
+    const articleData = await articleResponse.json();
+    
+    const businessCount = businessData.total_rows || 0;
+    const articleCount = articleData.total_rows || 0;
+    
+    console.log(`📊 CouchDB contains: ${businessCount} businesses, ${articleCount} articles`);
+    
+    return {
+      success: true,
+      message: `CouchDB contains: ${businessCount} businesses, ${articleCount} articles`,
+      businessCount,
+      articleCount,
+      isEmpty: businessCount === 0 && articleCount === 0
+    };
+  } catch (error) {
+    console.error('❌ Error verifying databases:', error);
+    return { success: false, message: error.message };
+  }
+};
+
+export const pushLocalDataToCouchDB = async () => {
+  try {
+    console.log('🔍 === Push Data Debug Start ===');
+    
+    const netInfo = await NetInfo.fetch();
+    const actualIsOnline = netInfo.isConnected;
+    console.log('📡 Fresh network check:', actualIsOnline);
+    
+    isOnline = actualIsOnline;
+    
+    if (!actualIsOnline) {
+      return { success: false, message: 'Device is offline (fresh check)' };
+    }
+    
+    if (!COUCHDB_CONFIG.currentUrl) {
+      console.log('🔍 No current URL, forcing detection...');
+      const detectedUrl = await detectCouchDBUrl();
+      if (!detectedUrl) {
+        return { success: false, message: 'No accessible CouchDB server found after detection attempt' };
+      }
+      console.log('✅ Detected URL after force check:', detectedUrl);
+    }
+
+    const db = await initDatabase();
+    
+    const businesses = await db.businesses.find().exec();
+    const articles = await db.articles.find().exec();
+    
+    console.log(`📤 Local data to push: ${businesses.length} businesses, ${articles.length} articles`);
+    
+    if (businesses.length === 0 && articles.length === 0) {
+      return { success: true, message: 'No local data to sync' };
+    }
+
+    console.log('🔄 Stopping current replications...');
+    stopSync();
+    
+    console.log('🔄 Starting fresh sync...');
+    await startSync(db);
+
+    return { success: true, message: `Sync restarted for ${businesses.length + articles.length} documents. Check console for sync progress.` };
+  } catch (error) {
+    console.error('❌ Error pushing local data:', error);
+    return { success: false, message: error.message };
+  }
+};
+
+// Helper functions
+export const getRxDatabase = async () => {
+  return await initDatabase();
+};
+
+export const clearAllData = async () => {
+  try {
+    await AsyncStorage.removeItem(BUSINESSES_KEY);
+    await AsyncStorage.removeItem(ARTICLES_KEY);
+    await AsyncStorage.removeItem(COUCHDB_URL_KEY);
+    
+    stopSync();
+    
+    if (dbInstance) {
+      await dbInstance.destroy();
+      dbInstance = null;
+    }
+    console.log('🧹 All data cleared');
+  } catch (error) {
+    console.error('❌ Error clearing data:', error);
   }
 };

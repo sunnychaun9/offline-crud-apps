@@ -1,8 +1,16 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, TextInput, FlatList, Button, StyleSheet } from 'react-native';
+import { View, Text, TextInput, FlatList, Button, StyleSheet, TouchableOpacity, Alert } from 'react-native';
 import { Picker } from '@react-native-picker/picker';
-import { initDatabase, addArticle, getArticlesByBusinessId, getAllBusinesses } from '../database/database';
+import { 
+  initDatabase, 
+  addArticle, 
+  getArticlesByBusinessId, 
+  getAllBusinesses, 
+  deleteArticleWithSync,
+  syncStorageWithDatabase
+} from '../database/database';
 import { v4 as uuidv4 } from 'uuid';
+import EditArticleModal from '../components/EditArticleModal';
 
 const ArticleScreen = () => {
   const [businesses, setBusinesses] = useState([]);
@@ -13,6 +21,8 @@ const ArticleScreen = () => {
   const [name, setName] = useState('');
   const [qty, setQty] = useState('');
   const [price, setPrice] = useState('');
+  const [editModalVisible, setEditModalVisible] = useState(false);
+  const [selectedArticle, setSelectedArticle] = useState(null);
 
   useEffect(() => {
     loadBusinesses();
@@ -28,11 +38,14 @@ const ArticleScreen = () => {
     try {
       setLoading(true);
       console.log('🔄 Loading businesses...');
-      
+
+      // Ensure storage is synced first
+      await syncStorageWithDatabase();
+
       // Use the proper database function that handles AsyncStorage loading
       const result = await getAllBusinesses();
       const list = result.map(doc => doc.toJSON());
-      
+
       console.log('📈 Businesses loaded in ArticleScreen:', list);
       setBusinesses(list);
 
@@ -54,6 +67,10 @@ const ArticleScreen = () => {
 
     try {
       console.log('🔍 Fetching articles for business:', selectedBusiness);
+      
+      // Ensure storage sync before fetching
+      await syncStorageWithDatabase();
+      
       const result = await getArticlesByBusinessId(selectedBusiness);
       const list = result.map(doc => doc.toJSON());
       console.log('🧾 Articles fetched for', selectedBusiness, list);
@@ -66,7 +83,7 @@ const ArticleScreen = () => {
 
   const handleAddArticle = async () => {
     if (!name || !qty || !price || !selectedBusiness) {
-      alert('Please fill all fields');
+      Alert.alert('Error', 'Please fill all fields');
       return;
     }
 
@@ -78,7 +95,7 @@ const ArticleScreen = () => {
         selling_price: parseFloat(price),
         business_id: selectedBusiness,
       };
-      
+
       console.log('➕ Adding article:', article);
       await addArticle(article);
       console.log('✅ Article added successfully');
@@ -87,24 +104,91 @@ const ArticleScreen = () => {
       setName('');
       setQty('');
       setPrice('');
-      
-      // Refresh articles list
-      fetchArticles();
+
+      // Refresh articles list with proper sync
+      await fetchArticles();
     } catch (error) {
       console.error('❌ Error adding article:', error);
-      alert('Error adding article: ' + error.message);
+      Alert.alert('Error', 'Error adding article: ' + error.message);
     }
   };
 
-  const handleRefresh = () => {
+  const handleEditArticle = (article) => {
+    setSelectedArticle(article);
+    setEditModalVisible(true);
+  };
+
+  const handleArticleUpdated = async (updatedArticle) => {
+    // Refresh the articles list with proper sync
+    await fetchArticles();
+  };
+
+  const handleDeleteArticle = async (article) => {
+    Alert.alert(
+      'Delete Article',
+      `Delete "${article.name}"?\n\nThis will be synced to all devices.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              console.log('🗑️ Deleting article with sync:', article.id, article.name);
+              
+              const success = await deleteArticleWithSync(article.id);
+              
+              if (success) {
+                console.log('✅ Article deleted and synced successfully');
+                
+                // Refresh the list immediately with proper sync
+                await fetchArticles();
+                
+                Alert.alert(
+                  'Deleted', 
+                  'Article deleted and synced to server.\n\nNote: Changes will be permanent after sync completes.'
+                );
+              } else {
+                Alert.alert('Error', 'Article not found');
+              }
+            } catch (error) {
+              console.error('❌ Delete error:', error);
+              Alert.alert('Error', `Failed to delete: ${error.message}`);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  const handleRefresh = async () => {
     console.log('🔄 Refreshing data...');
-    loadBusinesses();
+    await loadBusinesses();
+    if (selectedBusiness) {
+      await fetchArticles();
+    }
   };
 
   const renderItem = ({ item }) => (
     <View style={styles.item}>
-      <Text style={styles.name}>{item.name}</Text>
-      <Text>Qty: {item.qty} | ₹{item.selling_price}</Text>
+      <View style={styles.articleInfo}>
+        <Text style={styles.name}>{item.name}</Text>
+        <Text>Qty: {item.qty} | ₹{item.selling_price}</Text>
+      </View>
+      <View style={styles.articleActions}>
+        <TouchableOpacity
+          onPress={() => handleEditArticle(item)}
+          style={styles.actionButton}
+        >
+          <Text style={styles.editButton}>✏️</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={() => handleDeleteArticle(item)}
+          style={styles.actionButton}
+        >
+          <Text style={styles.deleteButton}>🗑️</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 
@@ -187,6 +271,15 @@ const ArticleScreen = () => {
           />
         </>
       )}
+      <EditArticleModal
+        visible={editModalVisible}
+        article={selectedArticle}
+        onClose={() => {
+          setEditModalVisible(false);
+          setSelectedArticle(null);
+        }}
+        onUpdate={handleArticleUpdated}
+      />
     </View>
   );
 };
@@ -194,8 +287,8 @@ const ArticleScreen = () => {
 export default ArticleScreen;
 
 const styles = StyleSheet.create({
-  container: { 
-    flex: 1, 
+  container: {
+    flex: 1,
     padding: 16,
     backgroundColor: '#fff'
   },
@@ -215,10 +308,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 16
   },
-  title: { 
-    fontSize: 18, 
-    fontWeight: 'bold', 
-    marginTop: 16 
+  title: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginTop: 16
   },
   noBusinessContainer: {
     flex: 1,
@@ -238,9 +331,9 @@ const styles = StyleSheet.create({
     color: '#666',
     marginBottom: 20
   },
-  picker: { 
-    backgroundColor: '#eee', 
-    marginVertical: 8 
+  picker: {
+    backgroundColor: '#eee',
+    marginVertical: 8
   },
   selectedInfo: {
     fontSize: 12,
@@ -261,14 +354,34 @@ const styles = StyleSheet.create({
     padding: 10,
     marginVertical: 4,
     borderRadius: 8,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
   },
-  name: { 
-    fontWeight: 'bold' 
+  name: {
+    fontWeight: 'bold'
   },
-  empty: { 
-    textAlign: 'center', 
+  empty: {
+    textAlign: 'center',
     marginTop: 20,
     color: '#666',
     fontStyle: 'italic'
+  },
+  articleInfo: {
+    flex: 1,
+  },
+  articleActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  actionButton: {
+    padding: 8,
+    marginLeft: 4,
+  },
+  editButton: {
+    fontSize: 16,
+  },
+  deleteButton: {
+    fontSize: 16,
   },
 });

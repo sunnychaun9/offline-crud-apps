@@ -11,10 +11,11 @@ import {
   RefreshControl,
   ScrollView,
 } from 'react-native';
-import { 
-  addBusiness, 
-  getAllBusinesses, 
-  initDatabase, 
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import {
+  addBusiness,
+  getAllBusinesses,
+  initDatabase,
   deleteBusiness,
   getSyncStatus,
   forceSyncNow,
@@ -22,10 +23,19 @@ import {
   setSyncEnabled,
   createCouchDBDatabases,
   pushLocalDataToCouchDB,
-  testCouchDBConnectivity
+  testCouchDBConnectivity,
+  fullDatabaseReset,
+  cleanupAndReset,
+  deleteCouchDBDatabases,
+  permanentlyDeleteAllData,
+  verifyDatabasesAreEmpty,
+  syncStorageWithDatabase,
+  clearAllData
 } from '../database/database';
 import { v4 as uuidv4 } from 'uuid';
 import NetInfo from '@react-native-community/netinfo';
+import EditBusinessModal from '../components/EditBusinessModal';
+import { getFetchWithCouchDBAuthorization } from 'rxdb/plugins/replication-couchdb';
 
 const BusinessScreen = () => {
   const [name, setName] = useState('');
@@ -36,7 +46,7 @@ const BusinessScreen = () => {
     syncEnabled: true,
     businessSyncActive: false,
     articleSyncActive: false,
-    couchdbUrl: '',
+    currentUrl: '',
     businessesDB: '',
     articlesDB: ''
   });
@@ -48,6 +58,8 @@ const BusinessScreen = () => {
   const [dbReady, setDbReady] = useState(false);
   const [debugLogs, setDebugLogs] = useState([]);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
+  const [editModalVisible, setEditModalVisible] = useState(false);
+  const [selectedBusiness, setSelectedBusiness] = useState(null);
 
   const addDebugLog = (message) => {
     const timestamp = new Date().toLocaleTimeString();
@@ -62,17 +74,17 @@ const BusinessScreen = () => {
   const initializeApp = async () => {
     try {
       addDebugLog('Starting app initialization...');
-      
+
       // Initialize database
       await initDatabase();
       setDbReady(true);
       addDebugLog('Database initialized successfully');
-      
+
       // Setup network monitoring
       const unsubscribe = NetInfo.addEventListener(state => {
         setIsOnline(state.isConnected);
         addDebugLog(`Network status: ${state.isConnected ? 'Online' : 'Offline'}`);
-        
+
         // Update sync status when network changes
         setTimeout(updateSyncStatus, 1000);
       });
@@ -91,8 +103,8 @@ const BusinessScreen = () => {
         }
       }
 
-      // Fetch initial data
-      await fetchBusinesses();
+      // Fetch initial data with proper sync
+      await fetchBusinessesWithSync();
       await updateSyncStatus();
 
       // Update sync status periodically
@@ -122,24 +134,137 @@ const BusinessScreen = () => {
     }
   };
 
-  const fetchBusinesses = async () => {
+  // Fixed fetchBusinesses to ensure proper sync with AsyncStorage
+  const fetchBusinessesWithSync = async () => {
     try {
+      addDebugLog('🔄 Fetching businesses with sync...');
+
+      // First, sync AsyncStorage with RxDB to ensure consistency
+      await syncStorageWithDatabase();
+
+      // Then fetch from RxDB
       const result = await getAllBusinesses();
       const list = result.map(doc => doc.toJSON());
-      addDebugLog(`Fetched ${list.length} businesses from database`);
+
+      addDebugLog(`✅ Fetched ${list.length} businesses from database`);
       setBusinesses(list);
+
+      return list;
     } catch (error) {
-      addDebugLog(`Error fetching businesses: ${error.message}`);
+      addDebugLog(`❌ Error fetching businesses: ${error.message}`);
       console.error('❌ Error fetching businesses:', error);
+      setBusinesses([]); // Clear on error
+      throw error;
     }
+  };
+
+  // Simplified fetchBusinesses for backward compatibility
+  const fetchBusinesses = async () => {
+    return await fetchBusinessesWithSync();
   };
 
   const onRefresh = async () => {
     setRefreshing(true);
-    addDebugLog('Manual refresh triggered');
-    await fetchBusinesses();
-    await updateSyncStatus();
-    setRefreshing(false);
+    addDebugLog('🔄 Manual refresh triggered - comprehensive sync');
+
+    try {
+      // Step 1: Force sync first to get latest data from CouchDB
+      if (isOnline && syncStatus.syncEnabled) {
+        addDebugLog('📡 Forcing sync to get latest data...');
+        const syncResult = await forceSyncNow();
+        if (syncResult.success) {
+          addDebugLog('✅ Sync completed successfully');
+          // Wait for sync to settle
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        } else {
+          addDebugLog(`⚠️ Sync failed: ${syncResult.message}`);
+        }
+      }
+
+      // Step 2: Sync storage with database
+      await syncStorageWithDatabase();
+
+      // Step 3: Refresh local data from database
+      addDebugLog('📊 Fetching fresh data from database...');
+      await fetchBusinessesWithSync();
+
+      // Step 4: Update sync status
+      await updateSyncStatus();
+
+      // Step 5: Verify data consistency
+      const stats = await getStorageStats();
+      addDebugLog(`📈 Data refreshed: ${stats.businesses} businesses, ${stats.articles} articles`);
+
+      addDebugLog('✅ Comprehensive refresh completed');
+
+    } catch (error) {
+      const errorMsg = `Refresh error: ${error.message}`;
+      addDebugLog(errorMsg);
+      console.error('❌ Error in comprehensive refresh:', error);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const onRefreshFromServer = async () => {
+    if (!isOnline) {
+      Alert.alert('Offline', 'Cannot refresh from server while offline');
+      return;
+    }
+
+    setRefreshing(true);
+    addDebugLog('🌐 Refreshing data from CouchDB server only...');
+
+    try {
+      // Step 1: Clear local cache to force fresh pull
+      addDebugLog('🧹 Clearing local cache...');
+
+      const db = await initDatabase();
+
+      // Clear local RxDB data
+      const businessDocs = await db.businesses.find().exec();
+      const articleDocs = await db.articles.find().exec();
+
+      for (const doc of businessDocs) {
+        await doc.remove();
+      }
+      for (const doc of articleDocs) {
+        await doc.remove();
+      }
+
+      // Clear AsyncStorage cache
+      await AsyncStorage.removeItem('businesses_data');
+      await AsyncStorage.removeItem('articles_data');
+
+      addDebugLog('✅ Local cache cleared');
+
+      // Step 2: Force pull from CouchDB
+      addDebugLog('📥 Pulling fresh data from CouchDB...');
+      const syncResult = await forceSyncNow();
+
+      if (syncResult.success) {
+        addDebugLog('✅ Fresh data pulled from server');
+
+        // Wait for sync to complete
+        await new Promise(resolve => setTimeout(resolve, 3000));
+
+        // Refresh UI
+        await fetchBusinessesWithSync();
+        await updateSyncStatus();
+
+        Alert.alert('Success', 'Data refreshed from server successfully');
+      } else {
+        addDebugLog(`❌ Server refresh failed: ${syncResult.message}`);
+        Alert.alert('Error', `Failed to refresh from server: ${syncResult.message}`);
+      }
+
+    } catch (error) {
+      const errorMsg = `Server refresh error: ${error.message}`;
+      addDebugLog(errorMsg);
+      Alert.alert('Error', errorMsg);
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   const handleAddBusiness = async () => {
@@ -158,21 +283,23 @@ const BusinessScreen = () => {
         id: uuidv4(),
         name: name.trim(),
       };
-      
+
       addDebugLog(`Adding business: ${businessData.name}`);
       await addBusiness(businessData);
       addDebugLog(`Business added successfully: ${businessData.id}`);
-      
+
       setName('');
-      await fetchBusinesses();
+
+      // Ensure proper refresh after adding
+      await fetchBusinessesWithSync();
       await updateSyncStatus();
-      
-      const syncMessage = isOnline && syncStatus.syncEnabled ? 
-        ' (Should sync to server...)' : 
+
+      const syncMessage = isOnline && syncStatus.syncEnabled ?
+        ' (Should sync to server...)' :
         ' (Will sync when online)';
-      
+
       Alert.alert(
-        'Success', 
+        'Success',
         `Business "${businessData.name}" added successfully!${syncMessage}`
       );
     } catch (error) {
@@ -181,6 +308,18 @@ const BusinessScreen = () => {
       console.error('❌ Error adding business:', error);
       Alert.alert('Error', errorMsg);
     }
+  };
+
+  const handleEditBusiness = (business) => {
+    setSelectedBusiness(business);
+    setEditModalVisible(true);
+  };
+
+  const handleBusinessUpdated = async (updatedBusiness) => {
+    // Refresh the businesses list with proper sync
+    await fetchBusinessesWithSync();
+    // Update storage stats
+    await updateSyncStatus();
   };
 
   const handleDelete = async (id) => {
@@ -200,7 +339,7 @@ const BusinessScreen = () => {
               if (doc) {
                 await deleteBusiness(doc);
                 addDebugLog(`Business deleted successfully: ${id}`);
-                await fetchBusinesses();
+                await fetchBusinessesWithSync();
                 await updateSyncStatus();
               }
             } catch (error) {
@@ -215,32 +354,121 @@ const BusinessScreen = () => {
     );
   };
 
-  // In the handleSetupDatabase function area, add:
-const handlePushData = async () => {
-  try {
-    addDebugLog('Manually pushing local data to CouchDB...');
-    const result = await pushLocalDataToCouchDB();
-    if (result.success) {
-      addDebugLog(`Push data result: ${result.message}`);
-      Alert.alert('Push Data', result.message);
-    } else {
-      addDebugLog(`Push data failed: ${result.message}`);
-      Alert.alert('Error', result.message);
-    }
-  } catch (error) {
-    const errorMsg = `Push data error: ${error.message}`;
-    addDebugLog(errorMsg);
-    console.log('❌ Error pushing data:', error);
-    Alert.alert('Error', errorMsg);
-  }
-};
+  // Debug functions
+  const handlePermanentReset = async () => {
+    Alert.alert(
+      '⚠️ PERMANENT DELETION',
+      'This will PERMANENTLY DELETE ALL DATA from both local storage and CouchDB servers. This action cannot be undone!\n\nAre you absolutely sure?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'DELETE EVERYTHING',
+          style: 'destructive',
+          onPress: () => {
+            Alert.alert(
+              'Final Confirmation',
+              'Last chance! This will delete ALL businesses and articles permanently. Continue?',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Yes, Delete All',
+                  style: 'destructive',
+                  onPress: async () => {
+                    try {
+                      addDebugLog('Starting permanent deletion of all data...');
 
-// Add this button in the debug panel buttons section:
-<Button title="Push Local Data" onPress={handlePushData} />
+                      const result = await permanentlyDeleteAllData();
+
+                      if (result.success) {
+                        addDebugLog('✅ All data permanently deleted');
+                        Alert.alert('Complete', 'All data has been permanently deleted from everywhere.');
+
+                        // Reset UI state
+                        setBusinesses([]);
+                        setDbReady(true);
+                        await updateSyncStatus();
+
+                      } else {
+                        addDebugLog(`❌ Permanent deletion failed: ${result.message}`);
+                        Alert.alert('Error', `Failed to delete all data: ${result.message}`);
+                      }
+                    } catch (error) {
+                      const errorMsg = `Permanent deletion error: ${error.message}`;
+                      addDebugLog(errorMsg);
+                      Alert.alert('Error', errorMsg);
+                    }
+                  }
+                }
+              ]
+            );
+          }
+        }
+      ]
+    );
+  };
+
+  const handleVerifyEmpty = async () => {
+    try {
+      addDebugLog('Verifying database contents...');
+
+      const result = await verifyDatabasesAreEmpty();
+
+      if (result.success) {
+        const message = `${result.message}\n\nDatabases are ${result.isEmpty ? 'EMPTY ✅' : 'NOT EMPTY ❌'}`;
+        addDebugLog(result.message);
+        Alert.alert('Database Status', message);
+      } else {
+        addDebugLog(`Verification failed: ${result.message}`);
+        Alert.alert('Error', `Verification failed: ${result.message}`);
+      }
+    } catch (error) {
+      const errorMsg = `Verification error: ${error.message}`;
+      addDebugLog(errorMsg);
+      Alert.alert('Error', errorMsg);
+    }
+  };
+
+  const handleCheckLocalStorage = async () => {
+    try {
+      const businessesData = await AsyncStorage.getItem('businesses_data');
+      const articlesData = await AsyncStorage.getItem('articles_data');
+
+      const businesses = businessesData ? JSON.parse(businessesData) : [];
+      const articles = articlesData ? JSON.parse(articlesData) : [];
+
+      const message = `AsyncStorage Contents:\n\nBusinesses: ${businesses.length}\nArticles: ${articles.length}\n\nBusiness Names:\n${businesses.map(b => `• ${b.name}`).join('\n')}\n\nArticle Names:\n${articles.map(a => `• ${a.name}`).join('\n')}`;
+
+      addDebugLog(`📋 AsyncStorage: ${businesses.length} businesses, ${articles.length} articles`);
+      Alert.alert('Local Storage Contents', message);
+
+    } catch (error) {
+      Alert.alert('Error', `Failed to check local storage: ${error.message}`);
+    }
+  };
+
+  // Add other handler functions here (handlePushData, handleTestConnectivity, etc.)
+  const handlePushData = async () => {
+    try {
+      addDebugLog('Manually pushing local data to CouchDB...');
+      const result = await pushLocalDataToCouchDB();
+      if (result.success) {
+        addDebugLog(`Push data result: ${result.message}`);
+        Alert.alert('Push Data', result.message);
+      } else {
+        addDebugLog(`Push data failed: ${result.message}`);
+        Alert.alert('Error', result.message);
+      }
+    } catch (error) {
+      const errorMsg = `Push data error: ${error.message}`;
+      addDebugLog(errorMsg);
+      console.log('❌ Error pushing data:', error);
+      Alert.alert('Error', errorMsg);
+    }
+  };
 
   const handleTestConnectivity = async () => {
     addDebugLog('Testing CouchDB connectivity manually...');
-    
+
     if (!isOnline) {
       Alert.alert('Offline', 'Cannot test connectivity while offline.');
       return;
@@ -248,10 +476,10 @@ const handlePushData = async () => {
 
     try {
       const isReachable = await testCouchDBConnectivity();
-      const message = isReachable ? 
-        'CouchDB server is reachable!' : 
+      const message = isReachable ?
+        'CouchDB server is reachable!' :
         'CouchDB server is not reachable. Check IP address and server status.';
-      
+
       addDebugLog(`Connectivity test result: ${message}`);
       Alert.alert('Connectivity Test', message);
     } catch (error) {
@@ -259,6 +487,69 @@ const handlePushData = async () => {
       addDebugLog(errorMsg);
       Alert.alert('Error', errorMsg);
     }
+  };
+
+  const handleForceWorkingURL = async () => {
+    const workingURL = 'http://192.168.1.100:5984';
+
+    Alert.alert(
+      'Force Working URL Test',
+      `Testing the URL that works in your browser: ${workingURL}`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Test Now',
+          onPress: async () => {
+            try {
+              addDebugLog(`🔍 Testing known working URL: ${workingURL}`);
+
+              // Test basic fetch
+              const response = await fetch(workingURL, {
+                method: 'GET',
+                timeout: 10000,
+              });
+
+              if (response.ok) {
+                const data = await response.text();
+                addDebugLog(`✅ Basic fetch SUCCESS: ${workingURL}`);
+
+                // Test with CouchDB auth
+                const customFetch = getFetchWithCouchDBAuthorization('shani', 'shani@123456');
+                const authResponse = await customFetch(workingURL);
+
+                if (authResponse.ok) {
+                  addDebugLog(`✅ Authenticated fetch SUCCESS: ${workingURL}`);
+
+                  // Try to manually set this URL and test sync
+                  await AsyncStorage.setItem('couchdb_url', workingURL);
+
+                  Alert.alert(
+                    'Success!',
+                    `✅ Both basic and authenticated requests work!\n\nURL: ${workingURL}\n\nResponse preview: ${data.substring(0, 100)}...\n\nTrying to force sync now...`
+                  );
+
+                  // Force a sync test
+                  setTimeout(async () => {
+                    const syncResult = await forceSyncNow();
+                    addDebugLog(`Forced sync result: ${syncResult.message}`);
+                  }, 1000);
+
+                } else {
+                  addDebugLog(`❌ Authenticated fetch failed: ${authResponse.status}`);
+                  Alert.alert('Auth Failed', `Basic fetch worked but authentication failed.\n\nStatus: ${authResponse.status}\n\nCheck username/password.`);
+                }
+              } else {
+                addDebugLog(`❌ Basic fetch failed: ${response.status}`);
+                Alert.alert('Failed', `HTTP ${response.status} from ${workingURL}\n\nEven though it works in browser.`);
+              }
+            } catch (error) {
+              addDebugLog(`❌ Force URL test error: ${error.message}`);
+              Alert.alert('Error', `Failed to connect to ${workingURL}\n\nError: ${error.message}\n\nThis is strange since it works in your browser.`);
+            }
+          }
+        }
+      ]
+    );
   };
 
   const handleForceSync = async () => {
@@ -269,7 +560,7 @@ const handlePushData = async () => {
 
     try {
       addDebugLog('Starting manual sync...');
-      
+
       // Test connectivity first
       const isReachable = await testCouchDBConnectivity();
       if (!isReachable) {
@@ -285,7 +576,7 @@ const handlePushData = async () => {
       }
 
       const result = await forceSyncNow();
-      
+
       if (result.success) {
         addDebugLog('Manual sync started successfully');
         Alert.alert('Sync Started', 'Manual sync has been initiated. Check debug logs for progress.');
@@ -305,13 +596,13 @@ const handlePushData = async () => {
   const handleToggleSync = () => {
     const newSyncEnabled = !syncStatus.syncEnabled;
     setSyncEnabled(newSyncEnabled);
-    
+
     addDebugLog(`Sync ${newSyncEnabled ? 'enabled' : 'disabled'}`);
     Alert.alert(
-      'Sync Settings', 
+      'Sync Settings',
       `Sync has been ${newSyncEnabled ? 'enabled' : 'disabled'}`
     );
-    
+
     setTimeout(updateSyncStatus, 1000);
   };
 
@@ -338,44 +629,45 @@ const handlePushData = async () => {
     }
   };
 
+  // Rest of your component methods (getSyncStatusText, getSyncStatusColor, renderItem, renderDebugPanel)...
   const getSyncStatusText = () => {
     if (!dbReady) {
       return '🔧 Initializing...';
     }
-    
+
     if (!syncStatus.syncEnabled) {
       return '⏸️ Sync Disabled';
     }
-    
+
     if (!syncStatus.isOnline) {
       return '📱 Offline Mode';
     }
-    
+
     if (syncStatus.businessSyncActive || syncStatus.articleSyncActive) {
       return '🔄 Syncing...';
     }
-    
+
     return '✅ Online & Ready';
   };
 
   const getSyncStatusColor = () => {
     if (!dbReady) {
-      return '#9E9E9E'; // Gray for initializing
+      return '#9E9E9E';
     }
-    
+
     if (!syncStatus.syncEnabled) {
-      return '#9E9E9E'; // Gray for disabled
+      return '#9E9E9E';
     }
-    
+
     if (!syncStatus.isOnline) {
-      return '#FF9800'; // Orange for offline
+      return '#FF9800';
     }
-    
+
     if (syncStatus.businessSyncActive || syncStatus.articleSyncActive) {
-      return '#2196F3'; // Blue for syncing
+      return '#2196F3';
     }
-    
-    return '#4CAF50'; // Green for ready
+
+    return '#4CAF50';
   };
 
   const renderItem = ({ item }) => (
@@ -384,9 +676,20 @@ const handlePushData = async () => {
         <Text style={styles.name}>{item.name}</Text>
         <Text style={styles.id}>ID: {item.id.substring(0, 8)}...</Text>
       </View>
-      <TouchableOpacity onPress={() => handleDelete(item.id)}>
-        <Text style={styles.delete}>🗑️</Text>
-      </TouchableOpacity>
+      <View style={styles.actionButtons}>
+        <TouchableOpacity
+          onPress={() => handleEditBusiness(item)}
+          style={styles.actionButton}
+        >
+          <Text style={styles.editButton}>✏️</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={() => handleDelete(item.id)}
+          style={styles.actionButton}
+        >
+          <Text style={styles.delete}>🗑️</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 
@@ -398,11 +701,11 @@ const handlePushData = async () => {
           <Text style={styles.closeButton}>✕</Text>
         </TouchableOpacity>
       </View>
-      
+
       <ScrollView style={styles.debugContent}>
         <View style={styles.debugSection}>
           <Text style={styles.debugSectionTitle}>Current Status:</Text>
-          <Text style={styles.debugText}>CouchDB URL: {syncStatus.couchdbUrl}</Text>
+          <Text style={styles.debugText}>CouchDB URL: {syncStatus.currentUrl}</Text>
           <Text style={styles.debugText}>Businesses DB: {syncStatus.businessesDB}</Text>
           <Text style={styles.debugText}>Articles DB: {syncStatus.articlesDB}</Text>
           <Text style={styles.debugText}>Online: {syncStatus.isOnline ? 'Yes' : 'No'}</Text>
@@ -416,6 +719,35 @@ const handlePushData = async () => {
           {debugLogs.map((log, index) => (
             <Text key={index} style={styles.debugLogText}>{log}</Text>
           ))}
+        </View>
+
+        <View style={styles.debugSection}>
+          <Text style={styles.debugSectionTitle}>🎯 Known Working URL Test:</Text>
+          <View style={styles.debugButtons}>
+            <Button title="Test 192.168.1.100:5984" onPress={handleForceWorkingURL} />
+          </View>
+        </View>
+
+        <View style={styles.debugSection}>
+          <Text style={styles.debugSectionTitle}>🔄 Refresh Options:</Text>
+          <View style={styles.debugButtons}>
+            <Button title="Normal Refresh" onPress={onRefresh} />
+            <Button title="Server Refresh" onPress={onRefreshFromServer} />
+            <Button title="Local Only" onPress={fetchBusinesses} />
+            <Button title="Check Local Storage" onPress={handleCheckLocalStorage} />
+          </View>
+        </View>
+
+        <View style={styles.debugSection}>
+          <Text style={styles.debugSectionTitle}>⚠️ Danger Zone:</Text>
+          <View style={styles.debugButtons}>
+            <Button title="Verify Empty" onPress={handleVerifyEmpty} />
+            <Button
+              title="PERMANENT RESET"
+              onPress={handlePermanentReset}
+              color="red"
+            />
+          </View>
         </View>
 
         <Button title="Push Local Data" onPress={handlePushData} />
@@ -438,8 +770,8 @@ const handlePushData = async () => {
             {getSyncStatusText()}
           </Text>
           <View style={styles.statusButtons}>
-            <TouchableOpacity 
-              onPress={() => setShowDebugPanel(true)} 
+            <TouchableOpacity
+              onPress={() => setShowDebugPanel(true)}
               style={styles.syncButton}
             >
               <Text style={styles.syncButtonText}>🐛</Text>
@@ -471,13 +803,12 @@ const handlePushData = async () => {
           📦 {storageStats.businesses} Businesses | 🧾 {storageStats.articles} Articles
         </Text>
         <Text style={styles.statsSubText}>
-          Business Sync: {syncStatus.businessSyncActive ? '🟢 Active' : '⚪ Idle'} | 
+          Business Sync: {syncStatus.businessSyncActive ? '🟢 Active' : '⚪ Idle'} |
           Article Sync: {syncStatus.articleSyncActive ? '🟢 Active' : '⚪ Idle'}
         </Text>
       </View>
 
       <View style={styles.content}>
-        {/* <Text style={styles.heading}>Add Business</Text> */}
         <TextInput
           value={name}
           onChangeText={setName}
@@ -485,8 +816,8 @@ const handlePushData = async () => {
           style={styles.input}
           editable={dbReady}
         />
-        <Button 
-          title="Add Business" 
+        <Button
+          title="Add Business"
           onPress={handleAddBusiness}
           disabled={!dbReady}
         />
@@ -511,7 +842,16 @@ const handlePushData = async () => {
       </View>
 
       {/* Debug Panel Modal */}
-      {/* {showDebugPanel && renderDebugPanel()} */}
+      {showDebugPanel && renderDebugPanel()}
+      <EditBusinessModal
+        visible={editModalVisible}
+        business={selectedBusiness}
+        onClose={() => {
+          setEditModalVisible(false);
+          setSelectedBusiness(null);
+        }}
+        onUpdate={handleBusinessUpdated}
+      />
     </View>
   );
 };
@@ -607,11 +947,6 @@ const styles = StyleSheet.create({
     color: 'gray',
     marginTop: 2,
   },
-  address: {
-    fontSize: 12,
-    color: '#666',
-    marginTop: 2,
-  },
   delete: {
     fontSize: 18,
     padding: 8,
@@ -673,5 +1008,16 @@ const styles = StyleSheet.create({
   },
   debugButtons: {
     gap: 10,
+  },
+  actionButtons: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  actionButton: {
+    padding: 8,
+    marginLeft: 4,
+  },
+  editButton: {
+    fontSize: 18,
   },
 });
