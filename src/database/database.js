@@ -142,8 +142,6 @@ export const initDatabase = async () => {
       articles: { schema: articleSchema }
     });
 
-    console.log('✅ Hybrid Database initialized successfully (RxDB + SQLite)');
-
     // Load data from SQLite into RxDB
     await loadFromSQLiteToRxDB(db);
     
@@ -226,7 +224,7 @@ const setupNetworkMonitoring = async (db) => {
       }
     });
   } catch (error) {
-    console.error('❌ Error setting up network monitoring:', error);
+    console.error('Error setting up network monitoring:', error);
   }
 };
 
